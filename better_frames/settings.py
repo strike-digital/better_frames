@@ -1,3 +1,5 @@
+from colorsys import hsv_to_rgb
+from random import random, randrange
 import bpy
 import inspect
 from bpy.props import PointerProperty, CollectionProperty, BoolProperty, FloatVectorProperty, IntProperty
@@ -5,7 +7,7 @@ from bpy.types import PropertyGroup
 from ..shared.helpers import Polygon
 
 
-def ObjectProperty(type, set_func, var_name=""):
+def PyObjectProperty(type, set_func, var_name=""):
     """Create a property to represent a python object."""
     obj = type  # Dont use python keywords
     del type
@@ -24,19 +26,44 @@ def ObjectProperty(type, set_func, var_name=""):
 
 class FrameItem(PropertyGroup):
 
-    color: FloatVectorProperty(size=4)
+    color: FloatVectorProperty(
+        name="Color",
+        description="The color of this frame",
+        size=4,
+        default=(0, 0, 0, .8),
+        soft_min=0,
+        soft_max=1,
+        subtype="COLOR",
+    )
 
     update_uids: BoolProperty(default=True)
 
-    def polygon_set(self, prop_name, value):
+    tag_remove: BoolProperty()
+
+    def active_update(self, context):
+        if self.active:
+            for frame in self.id_data.better_frames.frames:
+                if frame == self:
+                    continue
+                frame.active = False
+
+    active: BoolProperty(default=False, update=active_update)
+
+    def _polygon_set(self, prop_name, value):
         if isinstance(value, Polygon):
             self[prop_name] = value.verts
         else:
             self[prop_name] = value
 
-    shape: Polygon = ObjectProperty(type=Polygon, set_func=polygon_set)
+    shape: Polygon = PyObjectProperty(type=Polygon, set_func=_polygon_set)
 
-    shape_region: Polygon = ObjectProperty(type=Polygon, set_func=polygon_set)
+    shape_region: Polygon = PyObjectProperty(type=Polygon, set_func=_polygon_set)
+
+    def remove_nodes(self, nodes):
+        current_nodes = set(self.nodes)
+        nodes = current_nodes - set(nodes)
+        if nodes != current_nodes:
+            self.nodes = nodes
 
     def __str__(self):
         return f"FrameItem({self.shape_region})"
@@ -62,8 +89,8 @@ class FrameItem(PropertyGroup):
                 nodes.add(n)
 
         # assume that the node has been removed
-        all_uids = self["_node_uids"].to_list()
         if unfound_uids:
+            all_uids = self["_node_uids"].to_list()
             for uid in unfound_uids:
                 print(uid)
                 try:
@@ -71,6 +98,7 @@ class FrameItem(PropertyGroup):
                 except ValueError:
                     pass
                 self["_node_uids"] = all_uids
+
         return nodes
 
     @nodes.setter
@@ -78,11 +106,22 @@ class FrameItem(PropertyGroup):
         """Get a list of unique IDs that reference all of the nodes passed.
         uids are automatically regenerated every time the nodes are set,
         but this can be stopped by setting 'update_uids' to False"""
+
+        if not nodes:
+            self.tag_remove = True
+            return
+
         uids = []
         for n in nodes:
             if self.update_uids:
                 n.better_frames.uid_set()
             uids.append(n.better_frames.uid)
+
+        for frame in self.id_data.better_frames.frames:
+            if frame == self:
+                continue
+            frame.remove_nodes(nodes)
+
         self["_node_uids"] = uids
 
 
@@ -93,12 +132,33 @@ class BetterFramesSettings(PropertyGroup):
     def add_frame(self, nodes):
         frame = self.frames.add()
         frame.nodes = nodes
+        color = list(hsv_to_rgb(random(), 0.5, 0.55)) + [.8]
+        frame.color = color
+
+    def frame_order_set(self, value):
+        self["_frame_order"] = value
+
+    frame_order = property(lambda self: self.get("_frame_order", []), frame_order_set)
+
+    def reorder_frames(self):
+        ordered_frames = sorted(list(self.frames), key=lambda frame: frame.shape.area(), reverse=True)
+        frame_order = []
+        for frame in ordered_frames:
+            frame_order.append(list(self.frames).index(frame))
+        self.frame_order = frame_order
 
     show_test: BoolProperty(
         name="show test operator",
         description="show test operator",
         default=False,
     )
+
+    def get_active(self):
+        for f in self.frames:
+            if f.active:
+                return f
+
+    active = property(fget=get_active)
 
 
 class BetterFramesNodeSettings(PropertyGroup):
@@ -124,66 +184,12 @@ class BetterFramesNodeSettings(PropertyGroup):
     )
 
 
-# def copy_properties(from_data, to_data):
-#     """Copy all unique properties from one data block to another"""
-#     properties = set(dir(from_data)) - set(dir(from_data.bl_rna.base))  # remove properties inherited from PropertyGroup
-#     properties = [p for p in properties if "__" not in p]  # remove dunder properties
-#     properties.extend(["name"])  # name is an inherited property that still needs to be saved
-
-#     for prop in properties:
-#         setattr(to_data, prop, getattr(from_data, prop))
-
-#     keys = set(from_data.keys())
-#     keys = keys - set(properties)
-#     for k in keys:
-#         to_data[k] = from_data[k]
-
-# @persistent
-# def save_pre(*_):
-#     """Properties in the window manager aren't saved with the blend file,
-#     So this writes those properties to the current scene so they will be saved.
-#     They can then be read back into the window manager on loading the file"""
-#     bf = bpy.context.window_manager.better_frames
-#     scene_bf = bpy.data.scenes[0].better_frames
-#     bf: BetterFramesSettings
-#     scene_bf: BetterFramesSettings
-#     scene_bf.frames.clear()
-
-#     for frame in bf.frames:
-#         scene_frame = scene_bf.frames.add()
-#         frame.update_uids = scene_frame.update_uids = False
-#         copy_properties(frame, scene_frame)
-#         frame.update_uids = scene_frame.update_uids = True
-
-# @persistent
-# def load_post(*_):
-#     """Load the properties that have been saved in the scene back into the window manager"""
-#     bf = bpy.context.window_manager.better_frames
-#     scene_bf = bpy.data.scenes[0].better_frames
-
-#     for scene_frame in scene_bf.frames:
-#         frame = bf.frames.add()
-#         frame.update_uids = scene_frame.update_uids = False
-#         copy_properties(scene_frame, frame)
-#         frame.update_uids = scene_frame.update_uids = True
-
-
 def register():
     BetterFramesSettings.frames = CollectionProperty(type=FrameItem)
     bpy.types.NodeTree.better_frames = PointerProperty(type=BetterFramesSettings)
-    # bpy.types.Scene.better_frames = PointerProperty(type=BetterFramesSettings)
-    # bpy.types.WindowManager.better_frames = PointerProperty(type=BetterFramesSettings)
     bpy.types.Node.better_frames = PointerProperty(type=BetterFramesNodeSettings)
-
-    # handlers.save_pre.append(save_pre)
-    # handlers.load_post.append(load_post)
 
 
 def unregister():
     del bpy.types.NodeTree.better_frames
-    # del bpy.types.Scene.better_frames
-    # del bpy.types.WindowManager.better_frames
     del bpy.types.Node.better_frames
-
-    # handlers.save_pre.remove(save_pre)
-    # handlers.load_post.remove(load_post)

@@ -1,20 +1,20 @@
 from bpy.types import Panel, UILayout
 
 
-class TEST_PT_panel(Panel):
-    """Creates a Panel"""
-    bl_space_type = "VIEW_3D"
+class BETTER_FRAMES_PT_node_panel(Panel):
+    """Creates a panel for showing info about the currently active better frame"""
+    bl_space_type = "NODE_EDITOR"
     bl_region_type = "UI"
-    bl_label = "Test panel"
+    bl_label = "Better Frames"
+    bl_parent_id = "NODE_PT_active_node_generic"
     bl_category = "Test panel"
+
+    @classmethod
+    def poll(self, context):
+        return context.space_data.node_tree.better_frames.active is not None
 
     def draw(self, context):
         layout: UILayout = self.layout
-        tt = context.scene.better_frames
+        bf = context.space_data.node_tree.better_frames
 
-        layout.prop(
-            tt,
-            "show_test",
-        )
-        if tt.show_test:
-            layout.operator("node.better_frames_enable")
+        layout.prop(bf.active, "color", text="")

@@ -20,7 +20,7 @@
 # Most of the compostior nodes
 
 bl_info = {
-    "name": "Better frames",
+    "name": "Better node frames",
     "author": "Andrew Stevenson",
     "description": "Adds a new type of frame that shrinkwraps to the shape of it's nodes",
     "blender": (3, 0, 0),

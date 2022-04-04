@@ -1,3 +1,4 @@
+from collections import deque
 import bpy
 import blf
 import gpu
@@ -6,13 +7,12 @@ from bpy.types import Operator, Context
 from mathutils import Vector as V
 from mathutils.geometry import convex_hull_2d
 from math import sin, cos, tau
-from statistics import mean
 from ..shared.functions import draw_lines, draw_tris, get_node_loc
-from ..shared.helpers import Polygon, view_to_region, region_to_view, get_active_tree, dpifac
+from ..shared.helpers import Polygon, Rectangle, Timer, view_to_region, region_to_view, get_active_tree, dpifac
 from .settings import BetterFramesSettings, FrameItem
-from time import perf_counter
 
 handlers = []
+timer = Timer(average_of=40)
 
 
 def remove_handler(handler, remove_from_list=True):
@@ -55,16 +55,26 @@ class BetterFramesOperator(Operator):
         self.mouse_pos_screen = V((0, 0))
         self.prev_pos = V((0, 0))
         self.start_pos = V((0, 0))
+        self.prev_no_of_frames = 0
         self.on_frame = None
+        self.prev_events = deque(maxlen=5)
 
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
+        timer.start("operator")
         context.area.tag_redraw()
         e_type = event.type
+        e_value = event.value
         node_tree = get_active_tree(context)
+        # prev_events = self.prev_events.copy()
+        self.prev_events.append(event)
         bf: BetterFramesSettings = node_tree.better_frames
+
+        for i, frame in enumerate(bf.frames):
+            if frame.tag_remove:
+                bf.frames.remove(i)
 
         if e_type == 'MOUSEMOVE':
             self.prev_pos = self.mouse_pos.copy()
@@ -73,19 +83,14 @@ class BetterFramesOperator(Operator):
 
             if self.dragging_frame:
                 difference = (self.mouse_pos - self.prev_pos) / dpifac()
-                frame_nodes = self.dragging_frame.nodes
+                frame_nodes = set(self.dragging_frame.nodes)
                 for node in frame_nodes:
+                    if node.parent and node.parent in frame_nodes:
+                        continue
                     node.location += difference
+                timer.end("operator")
                 return {'RUNNING_MODAL'}
 
-            for frame in bf.frames:
-                if not frame.shape_region.verts:
-                    continue
-                distance = frame.shape_region.distance_to_edges(point=self.mouse_pos_screen)
-                if distance < 10:
-                    context.window.cursor_modal_set("SCROLL_XY")
-                    self.on_frame = frame
-                    break
             else:
                 self.on_frame = None
                 context.window.cursor_modal_restore()
@@ -94,24 +99,52 @@ class BetterFramesOperator(Operator):
             if event.value == "RELEASE":
                 self.dragging_frame = None
             else:
-                if self.on_frame:
-                    self.dragging_frame = self.on_frame
-                    self.start_pos = self.mouse_pos
+                for node in node_tree.nodes:
+                    loc = node.location * dpifac()
+                    dims = node.dimensions * dpifac()
+                    node_rect = Rectangle(loc, V((loc.x + dims.x, loc.y - dims.y)))
+                    if node_rect.isinside(self.mouse_pos):
+                        break
+                else:
+                    for frame in bf.frames:
+                        distance = frame.shape_region.distance_to_edges(point=self.mouse_pos_screen)
+                        if distance < 10:
+                            context.window.cursor_modal_set("SCROLL_XY")
+                            self.on_frame = frame
+                    if self.on_frame:
+                        self.on_frame.active = True
+                        self.dragging_frame = self.on_frame
+                        self.start_pos = self.mouse_pos
+                        timer.end("operator")
+                        return {'RUNNING_MODAL'}
 
         elif e_type == 'RIGHTMOUSE':
             if self.dragging_frame:
                 for node in self.dragging_frame.nodes:
                     node.location += (self.start_pos - self.mouse_pos) / dpifac()
                 self.dragging_frame = None
+                timer.end("operator")
                 return {'RUNNING_MODAL'}
 
-        elif e_type == 'J' and event.ctrl and event.shift and event.value != 'RELEASE':
-            bf.add_frame([n for n in node_tree.nodes if n.select])
+        elif e_type == 'J' and e_value != "RELEASE":
+            selected = [n for n in node_tree.nodes if n.select]
+            if event.ctrl and event.shift:
+                bf.add_frame(selected)
+                bpy.ops.ed.undo_push()
+                timer.end("operator")
+                return {'RUNNING_MODAL'}
+            elif event.alt and event.shift:
+                for frame in bf.frames:
+                    frame.remove_nodes(selected)
+                bpy.ops.ed.undo_push()
+                timer.end("operator")
+                return {'RUNNING_MODAL'}
 
         elif e_type in {'ESC'}:
             remove_handler(self._handle)
             return {'CANCELLED'}
 
+        timer.end("operator")
         return {'PASS_THROUGH'}
 
 
@@ -125,19 +158,19 @@ def unregister():
             pass
 
 
-index = 0
-times = []
-times2 = []
-
-
 def draw_callback_px(self: BetterFramesOperator, context: Context):
-    start = perf_counter()
     offset = 20
     reroute_res = 9
     node_tree = get_active_tree(context)
-    frames: FrameItem = node_tree.better_frames.frames
+    bf: BetterFramesSettings = node_tree.better_frames
+    frames: FrameItem = bf.frames
+    frames = [frames[i] for i in bf.frame_order if not i > len(frames) - 1]
+    timer.start("all")
 
+    gpu.state.blend_set('ALPHA')
     for frame in frames:
+        timer.start("single_frames")
+        timer.start("get_coords")
         nodes = frame.nodes
         # print(nodes, frame._nodes)
         # Get a list of the corners of every node
@@ -167,48 +200,51 @@ def draw_callback_px(self: BetterFramesOperator, context: Context):
                     list(loc), [loc.x + dims.x, loc.y], [loc.x, loc.y - dims.y], [loc.x + dims.x, loc.y - dims.y]
                 ]
                 node_points.extend(corners)
-
+        timer.end("get_coords")
+        timer.start("convex_hull")
         # Create a convex hull from the corners of all nodes
         indeces = convex_hull_2d(node_points)
         shape = Polygon([node_points[i] for i in indeces])
         frame.shape = shape
         frame.shape_region = Polygon([view_to_region(context, p) for p in shape.verts])
-
-        global times2
-        if len(times2) > 40:
-            print("Convex hull time: " + str(mean(times2)))
-            times2.clear()
-        times2.append(perf_counter() - start)
+        timer.end("convex_hull")
+        timer.start("bevel")
 
         # Smooth the corners by using bezier interpolation between the last point, the current point and the next point.
         bevelled = shape.bevelled(radius=15)
         bevelled.verts = [view_to_region(context, p) for p in bevelled.verts]
 
+        timer.end("bevel")
         # import bgl
         # bgl.glHint(bgl.GL_POLYGON_SMOOTH_HINT, bgl.GL_NICEST)
         # bgl.glEnable(bgl.GL_BLEND)
         # bgl.glEnable(bgl.GL_POLYGON_SMOOTH)
 
-        gpu.state.blend_set('ALPHA')
-        draw_tris(bevelled.as_tris(), color=(0.7, 0, 0, 0.5))
-        draw_lines(bevelled.as_lines(), color=(1, 1, 1, 0.8))
+        timer.start("draw")
+        shadow_offset = V((5, -5))
+        # you can use the syntax (*[brightness_val] * 3, alpha_val) to specify any grey colour with only one number
+        draw_tris([p + shadow_offset for p in frame.shape_region.as_tris()], color=(*[0] * 3, 0.1))
 
+        draw_tris(bevelled.as_tris(), color=frame.color)
+
+        color = (1, 1, 1, 0.8) if frame.active else (*[0.0] * 3, 1.8)
+        draw_lines(bevelled.as_lines(), color=color, width=1)
+        timer.end("draw")
+        timer.end("single_frames")
+
+    bf = node_tree.better_frames
+    if self.prev_no_of_frames != len(bf.frames):
+        bf.reorder_frames()
+    self.prev_no_of_frames = len(bf.frames)
+
+    timer.end("all")
     gpu.state.blend_set('NONE')
 
-    global times
-    global index
-    if len(times) > 40:
-        if index > 40:
-            print(mean(times))
-            # print(len(nodes))
-            index = 0
-        del times[0]
-
-    times.append(perf_counter() - start)
-    index += 1
+    overall_time = timer.get_time("all") + timer.get_time("operator")
+    timer.print_all()
 
     # draw some text
     font_id = 0
     blf.position(font_id, 10, 10, 0)
     blf.size(font_id, 20, 72)
-    blf.draw(font_id, str(int(1 / mean(times))) + " fps")
+    # blf.draw(font_id, str(int(1 / overall_time)) + " fps")
