@@ -1,7 +1,7 @@
 from colorsys import hsv_to_rgb
-from random import random, randrange
 import bpy
 import inspect
+from random import random
 from bpy.props import PointerProperty, CollectionProperty, BoolProperty, FloatVectorProperty, IntProperty
 from bpy.types import PropertyGroup
 from ..shared.helpers import Polygon
@@ -36,9 +36,25 @@ class FrameItem(PropertyGroup):
         subtype="COLOR",
     )
 
-    update_uids: BoolProperty(default=True)
+    update_uids: BoolProperty(
+        default=True,
+        description="Whether to update the uids of the nodes in this frame when they are set",
+    )
 
-    tag_remove: BoolProperty()
+    update_other_nodes: BoolProperty(
+        default=True,
+        description="Whether to update the nodes of other frames when the nodes of this frame are set",
+    )
+
+    tag_remove: BoolProperty(
+        default=False,
+        description="Whether to remove this frame in the next modal update",
+    )
+
+    tag_shape_update: BoolProperty(
+        default=True,
+        description="Whether or not to recalculate the shape of this frame",
+    )
 
     def active_update(self, context):
         if self.active:
@@ -59,11 +75,25 @@ class FrameItem(PropertyGroup):
 
     shape_region: Polygon = PyObjectProperty(type=Polygon, set_func=_polygon_set)
 
+    shape_bevelled: Polygon = PyObjectProperty(type=Polygon, set_func=_polygon_set)
+
     def remove_nodes(self, nodes):
         current_nodes = set(self.nodes)
         nodes = current_nodes - set(nodes)
         if nodes != current_nodes:
+            self.update_other_nodes = self.update_uids = False
             self.nodes = nodes
+            self.update_other_nodes = self.update_uids = True
+            self.tag_shape_update = True
+
+    def update_loc_dims(self):
+        locs = []
+        dims = []
+        for node in self.nodes:
+            locs.append(node.location)
+            dims.append(node.dimensions)
+        self["_locations"] = locs
+        self["_dimensions"] = dims
 
     def __str__(self):
         return f"FrameItem({self.shape_region})"
@@ -75,29 +105,36 @@ class FrameItem(PropertyGroup):
     def nodes(self):
         """Since we can't keep direct references to nodes as python objects (they are replaced by blender often),
         We instead create a unique ID for each node, and only store those."""
-        all_uids = list(self.get("_node_uids", [])).copy()
+        all_uids = self.get("_node_uids", [])
+        all_uids = set(all_uids)
+
         unfound_uids = all_uids.copy()
         nodes = set()
         for n in self.id_data.nodes:
-            if n.better_frames.uid in all_uids:
+            uid = n.better_frames.uid
+            if uid in all_uids:
                 try:
-                    unfound_uids.remove(n.better_frames.uid)
-                except ValueError:
+                    unfound_uids.remove(uid)
+                except KeyError:
+                    # Assign a new uid to any nodes that have been duplicated
                     n.better_frames.uid_set()
-                    all_uids.append(n.better_frames.uid)
-                    self["_node_uids"] = all_uids
+                    all_uids.add(n.better_frames.uid)
+                    self["_locations"] = list(self["_locations"]) + [n.location]
+                    self["_dimensions"] = list(self["_dimensions"]) + [n.dimensions]
+                    self["_node_uids"] = list(all_uids)
+                    pass
+
                 nodes.add(n)
 
         # assume that the node has been removed
         if unfound_uids:
-            all_uids = self["_node_uids"].to_list()
+            all_uids = set(self["_node_uids"])
             for uid in unfound_uids:
-                print(uid)
                 try:
                     all_uids.remove(uid)
                 except ValueError:
                     pass
-                self["_node_uids"] = all_uids
+            self["_node_uids"] = list(all_uids)
 
         return nodes
 
@@ -111,29 +148,36 @@ class FrameItem(PropertyGroup):
             self.tag_remove = True
             return
 
+        self.update_loc_dims()
         uids = []
+
         for n in nodes:
             if self.update_uids:
                 n.better_frames.uid_set()
             uids.append(n.better_frames.uid)
 
-        for frame in self.id_data.better_frames.frames:
-            if frame == self:
-                continue
-            frame.remove_nodes(nodes)
+        if self.update_other_nodes:
+            for frame in self.id_data.better_frames.frames:
+                if frame == self:
+                    continue
+                frame.remove_nodes(nodes)
 
         self["_node_uids"] = uids
 
 
 class BetterFramesSettings(PropertyGroup):
+    """Registered to bpy.types.NodeTree"""
 
     frames: list[FrameItem]
 
     def add_frame(self, nodes):
         frame = self.frames.add()
         frame.nodes = nodes
-        color = list(hsv_to_rgb(random(), 0.5, 0.55)) + [.8]
+        print(frame.nodes)
+        frame["_name"] = str(len(self.frames))
+        color = list(hsv_to_rgb(random(), 0.6, 0.55)) + [.8]
         frame.color = color
+        frame.active = True
 
     def frame_order_set(self, value):
         self["_frame_order"] = value
@@ -158,10 +202,20 @@ class BetterFramesSettings(PropertyGroup):
             if f.active:
                 return f
 
-    active = property(fget=get_active)
+    def set_active(self, value):
+        if not value:
+            for frame in self.frames:
+                frame.active = False
+        for frame in self.frames:
+            if frame == value:
+                frame.active = True
+                return
+
+    active = property(fget=get_active, fset=set_active)
 
 
 class BetterFramesNodeSettings(PropertyGroup):
+    """Settings registered to bpy.types.Node"""
 
     def uid_set(self, value=-1):
         """Create a garunteed unique ID value for this node. The value provided is not used."""

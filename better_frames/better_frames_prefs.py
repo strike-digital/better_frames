@@ -14,3 +14,4 @@ class BetterFramesPrefs():
 
         layout = draw_enabled_button(layout, self, "better_frames_enabled")
         layout.label(text="Some prefs!")
+# Hi there :)

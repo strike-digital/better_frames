@@ -7,7 +7,7 @@ from bpy.types import Operator, Context
 from mathutils import Vector as V
 from mathutils.geometry import convex_hull_2d
 from math import sin, cos, tau
-from ..shared.functions import draw_lines, draw_tris, get_node_loc
+from ..shared.functions import draw_lines_uniform, draw_tris_flat, draw_tris_uniform, get_node_loc
 from ..shared.helpers import Polygon, Rectangle, Timer, view_to_region, region_to_view, get_active_tree, dpifac
 from .settings import BetterFramesSettings, FrameItem
 
@@ -28,16 +28,18 @@ class BetterFramesOperator(Operator):
     bl_label = "Show better frames in the node editor"
 
     def invoke(self, context, event):
-        if context.area.type != 'NODE_EDITOR':
+        if context.area.type != 'NODE_EDITOR' or not context.space_data.node_tree:
             self.report({'WARNING'}, "Node editor not found, cannot run operator")
             return {'CANCELLED'}
 
-        node_tree = get_active_tree(context)
-
-        bf: BetterFramesSettings = node_tree.better_frames
-        bf.frames.clear()
-        bf.add_frame([n for n in node_tree.nodes if n.select])
-        bf.add_frame([n for n in node_tree.nodes if not n.select])
+        self.dragging_frame = False
+        self.mouse_pos = V((0, 0))
+        self.mouse_pos_screen = V((0, 0))
+        self.prev_pos = V((0, 0))
+        self.start_pos = V((0, 0))
+        self.prev_no_of_frames = 0
+        self.on_frame = None
+        self.prev_events = deque(maxlen=5)
 
         # draw behind nodes by using 'BACKDROP'
         global handlers
@@ -49,16 +51,6 @@ class BetterFramesOperator(Operator):
         )
 
         handlers.append(self._handle)
-
-        self.dragging_frame = False
-        self.mouse_pos = V((0, 0))
-        self.mouse_pos_screen = V((0, 0))
-        self.prev_pos = V((0, 0))
-        self.start_pos = V((0, 0))
-        self.prev_no_of_frames = 0
-        self.on_frame = None
-        self.prev_events = deque(maxlen=5)
-
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
@@ -67,8 +59,10 @@ class BetterFramesOperator(Operator):
         context.area.tag_redraw()
         e_type = event.type
         e_value = event.value
-        node_tree = get_active_tree(context)
-        # prev_events = self.prev_events.copy()
+        try:
+            node_tree = get_active_tree(context)
+        except AttributeError:
+            return {'PASS_THROUGH'}
         self.prev_events.append(event)
         bf: BetterFramesSettings = node_tree.better_frames
 
@@ -88,7 +82,7 @@ class BetterFramesOperator(Operator):
                     if node.parent and node.parent in frame_nodes:
                         continue
                     node.location += difference
-                timer.end("operator")
+                timer.stop("operator")
                 return {'RUNNING_MODAL'}
 
             else:
@@ -99,52 +93,59 @@ class BetterFramesOperator(Operator):
             if event.value == "RELEASE":
                 self.dragging_frame = None
             else:
-                for node in node_tree.nodes:
-                    loc = node.location * dpifac()
-                    dims = node.dimensions * dpifac()
-                    node_rect = Rectangle(loc, V((loc.x + dims.x, loc.y - dims.y)))
-                    if node_rect.isinside(self.mouse_pos):
-                        break
-                else:
-                    for frame in bf.frames:
-                        distance = frame.shape_region.distance_to_edges(point=self.mouse_pos_screen)
-                        if distance < 10:
-                            context.window.cursor_modal_set("SCROLL_XY")
-                            self.on_frame = frame
-                    if self.on_frame:
-                        self.on_frame.active = True
-                        self.dragging_frame = self.on_frame
-                        self.start_pos = self.mouse_pos
-                        timer.end("operator")
-                        return {'RUNNING_MODAL'}
+                region = context.area.regions[3]
+                area_rect = Rectangle(V((region.x, region.y)), V((region.x + region.width, region.y + region.height)))
+                if area_rect.isinside(self.mouse_pos_screen):
+                    for node in node_tree.nodes:
+                        loc = node.location * dpifac()
+                        dims = node.dimensions * dpifac()
+                        node_rect = Rectangle(loc, V((loc.x + dims.x, loc.y - dims.y)))
+                        if node_rect.isinside(self.mouse_pos):
+                            break
+                    else:
+                        for frame in bf.frames:
+                            distance = frame.shape_region.distance_to_edges(point=self.mouse_pos_screen)
+                            if distance < 10:
+                                context.window.cursor_modal_set("SCROLL_XY")
+                                self.on_frame = frame
+                        if self.on_frame:
+                            self.on_frame.active = True
+                            bpy.ops.ed.undo_push()
+                            self.dragging_frame = self.on_frame
+                            self.start_pos = self.mouse_pos
+                            timer.stop("operator")
+                            return {'RUNNING_MODAL'}
+                        else:
+                            bpy.ops.ed.undo_push()
+                            bf.active = None
 
         elif e_type == 'RIGHTMOUSE':
             if self.dragging_frame:
                 for node in self.dragging_frame.nodes:
                     node.location += (self.start_pos - self.mouse_pos) / dpifac()
                 self.dragging_frame = None
-                timer.end("operator")
+                timer.stop("operator")
                 return {'RUNNING_MODAL'}
 
-        elif e_type == 'J' and e_value != "RELEASE":
+        elif e_type == 'Q' and e_value != "RELEASE":
             selected = [n for n in node_tree.nodes if n.select]
             if event.ctrl and event.shift:
                 bf.add_frame(selected)
                 bpy.ops.ed.undo_push()
-                timer.end("operator")
+                timer.stop("operator")
                 return {'RUNNING_MODAL'}
             elif event.alt and event.shift:
                 for frame in bf.frames:
                     frame.remove_nodes(selected)
                 bpy.ops.ed.undo_push()
-                timer.end("operator")
+                timer.stop("operator")
                 return {'RUNNING_MODAL'}
 
         elif e_type in {'ESC'}:
             remove_handler(self._handle)
             return {'CANCELLED'}
 
-        timer.end("operator")
+        timer.stop("operator")
         return {'PASS_THROUGH'}
 
 
@@ -161,83 +162,161 @@ def unregister():
 def draw_callback_px(self: BetterFramesOperator, context: Context):
     offset = 20
     reroute_res = 9
-    node_tree = get_active_tree(context)
+    try:
+        node_tree = get_active_tree(context)
+    except AttributeError:
+        return
     bf: BetterFramesSettings = node_tree.better_frames
-    frames: FrameItem = bf.frames
-    frames = [frames[i] for i in bf.frame_order if not i > len(frames) - 1]
+    frames: list[FrameItem] = bf.frames
     timer.start("all")
+    frames = [frames[i] for i in bf.frame_order if not i > len(frames) - 1]
+    polys = []
+
+    area = context.area
+    view_scaling = (area.width / 4, area.height / 4)
+    view_rect = Rectangle(region_to_view(context, (0 - view_scaling[0], 0 - view_scaling[1])),
+                          (region_to_view(context, (area.width + view_scaling[0], area.height + view_scaling[1]))))
 
     gpu.state.blend_set('ALPHA')
     for frame in frames:
+
+        timer.start("frustum_culling")
+        shape = frame.shape
+        for v in shape.verts:
+            if view_rect.isinside(v):
+                break
+        else:
+            if not view_rect.isinside(shape.center()):
+                continue
+        timer.stop("frustum_culling")
+
         timer.start("single_frames")
-        timer.start("get_coords")
+        timer.start("changed")
+        # check to see whether the node locations or dimensions have changed
         nodes = frame.nodes
-        # print(nodes, frame._nodes)
-        # Get a list of the corners of every node
-        reroute_offset = offset * 2
-        node_points = []
-        for node in nodes:
-            if node.parent:
-                # if the node is in a frame, it doesn't need to be included
-                continue
-            if node.type == "REROUTE":
-                # if reroute then generate points in a circle around it to create a smooth corner for the convex hull.
-                # This is less efficient than using bezier smoothing after the convex hull,
-                # but that doesn't give good results for single reroutes
-                loc = node.location * dpifac()
-                for i in range(reroute_res):
-                    fac = i / reroute_res * tau
-                    x = sin(fac) * reroute_offset
-                    y = cos(fac) * reroute_offset
-                    node_points.append([loc[0] + x, loc[1] + y])
-                continue
+        changed = False
+        len_changed = False
+        if len(nodes) == 0:
+            frame.tag_remove = True
+            continue
+        if len(nodes) != len(frame.get("_locations", [])):
+            len_changed = True
+            frame.update_loc_dims()
+        locs = list(V(l) for l in frame.get("_locations", []))
+        dims = list(V(l) for l in frame.get("_dimensions", []))
+        for i, node in enumerate(nodes):
+            if node.location != locs[i] or node.dimensions != dims[i]:
+                changed = True
+                break
+        timer.stop("changed")
 
-            else:
-                # add each corner of the node + an offset
-                loc = get_node_loc(node) * dpifac() - V((offset, -offset))
-                dims = node.dimensions + V((offset * 2, offset * 2))
-                corners = [
-                    list(loc), [loc.x + dims.x, loc.y], [loc.x, loc.y - dims.y], [loc.x + dims.x, loc.y - dims.y]
-                ]
-                node_points.extend(corners)
-        timer.end("get_coords")
-        timer.start("convex_hull")
-        # Create a convex hull from the corners of all nodes
-        indeces = convex_hull_2d(node_points)
-        shape = Polygon([node_points[i] for i in indeces])
-        frame.shape = shape
-        frame.shape_region = Polygon([view_to_region(context, p) for p in shape.verts])
-        timer.end("convex_hull")
-        timer.start("bevel")
+        if frame.tag_shape_update or changed or len_changed:
+            frame.update_loc_dims()
+            timer.start("get_coords")
+            # Get a list of the corners of every node
+            reroute_offset = offset * 2
+            node_points = []
+            for node in nodes:
+                if node.parent:
+                    # if the node is in a frame, it doesn't need to be included
+                    continue
+                if node.type == "REROUTE":
+                    # If reroute then generate points in a circle around it
+                    # to create a smooth corner for the convex hull.
+                    # This is less efficient than using bezier smoothing after the convex hull,
+                    # but that doesn't give good results for single reroutes
+                    loc = node.location * dpifac()
+                    for i in range(reroute_res):
+                        fac = i / reroute_res * tau
+                        x = sin(fac) * reroute_offset
+                        y = cos(fac) * reroute_offset
+                        node_points.append([loc[0] + x, loc[1] + y])
+                    continue
 
-        # Smooth the corners by using bezier interpolation between the last point, the current point and the next point.
-        bevelled = shape.bevelled(radius=15)
+                else:
+                    # add each corner of the node + an offset
+                    loc = get_node_loc(node) * dpifac() - V((offset, -offset))
+                    dims = node.dimensions + V((offset * 2, offset * 2))
+                    corners = [
+                        list(loc), [loc.x + dims.x, loc.y], [loc.x, loc.y - dims.y], [loc.x + dims.x, loc.y - dims.y]
+                    ]
+                    node_points.extend(corners)
+            timer.stop("get_coords")
+            timer.start("convex_hull")
+            # Create a convex hull from the corners of all nodes
+            indeces = convex_hull_2d(node_points)
+            shape = Polygon([node_points[i] for i in indeces])
+            frame.shape = shape
+            timer.stop("convex_hull")
+            timer.start("bevel")
+
+            # Smooth the corners by using bezier interpolation between the last point,
+            # the current point and the next point.
+            bevelled = shape.bevelled(radius=15)
+            frame.shape_bevelled = bevelled
+
+            # timer.end("bevel")
+        else:
+            timer.start("get_coords")
+            bevelled = frame.shape_bevelled
+            # shape = frame.shape
+            timer.stop("get_coords")
+            timer.start("convex_hull")
+
+        shape_region = Polygon([view_to_region(context, p) for p in shape.verts])
+        frame.shape_region = shape_region
+        if not frame.tag_shape_update and not changed:
+            timer.stop("convex_hull")
+            timer.start("bevel")
         bevelled.verts = [view_to_region(context, p) for p in bevelled.verts]
 
-        timer.end("bevel")
-        # import bgl
-        # bgl.glHint(bgl.GL_POLYGON_SMOOTH_HINT, bgl.GL_NICEST)
-        # bgl.glEnable(bgl.GL_BLEND)
-        # bgl.glEnable(bgl.GL_POLYGON_SMOOTH)
+        bevelled.color = frame.color
+        bevelled.active = frame.active
+        polys.append(bevelled)
+        frame.tag_shape_update = False
 
-        timer.start("draw")
-        shadow_offset = V((5, -5))
-        # you can use the syntax (*[brightness_val] * 3, alpha_val) to specify any grey colour with only one number
-        draw_tris([p + shadow_offset for p in frame.shape_region.as_tris()], color=(*[0] * 3, 0.1))
+        timer.stop("bevel")
+        timer.stop("single_frames")
 
-        draw_tris(bevelled.as_tris(), color=frame.color)
+    shadow_offset = V((5, -5))
+    # # you can use the syntax (*[brightness_val] * 3, alpha_val) to specify any grey colour with only one number
+    line_color = (*[0.0] * 3, 0.5)
+    active_color = (*[1] * 3, 0.8)
 
-        color = (1, 1, 1, 0.8) if frame.active else (*[0.0] * 3, 1.8)
-        draw_lines(bevelled.as_lines(), color=color, width=1)
-        timer.end("draw")
-        timer.end("single_frames")
+    timer.start("create_draw_lists")
+    tris = []
+    all_colors = []
+    outlines = []
+    active_outline = []
 
-    bf = node_tree.better_frames
+    for poly in polys:
+        as_tris = poly.as_tris()
+        lines = poly.as_lines()
+        tris += as_tris
+        all_colors += [list(poly.color)] * len(as_tris)
+        if poly.active:
+            active_outline = lines
+        else:
+            outlines += lines
+    timer.stop("create_draw_lists")
+
+    timer.start("draw")
+    draw_tris_uniform([[p.x + shadow_offset.x, p.y + shadow_offset.y] for p in tris], color=(*[0] * 3, 0.1))  # shadow
+    draw_tris_flat(tris, colors=all_colors)  # main color
+
+    # V it turns out that doing this is about 2x faster than using native vector addition (p + shadow_offset) V
+    # TODO: Allow user to turn off shadow as it is very heavy. Probably auto turn off when fps is too low
+    draw_lines_uniform(outlines, color=line_color)  # main lines
+
+    draw_lines_uniform(active_outline, color=active_color)  # active lines
+
+    # Reorder frames so that the smallest ones are on top
     if self.prev_no_of_frames != len(bf.frames):
         bf.reorder_frames()
-    self.prev_no_of_frames = len(bf.frames)
+        self.prev_no_of_frames = len(bf.frames)
 
-    timer.end("all")
+    timer.stop("draw")
+    timer.stop("all")
     gpu.state.blend_set('NONE')
 
     overall_time = timer.get_time("all") + timer.get_time("operator")
@@ -247,4 +326,4 @@ def draw_callback_px(self: BetterFramesOperator, context: Context):
     font_id = 0
     blf.position(font_id, 10, 10, 0)
     blf.size(font_id, 20, 72)
-    # blf.draw(font_id, str(int(1 / overall_time)) + " fps")
+    blf.draw(font_id, str(int(1 / overall_time)) + " fps")
