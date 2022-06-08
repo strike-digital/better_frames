@@ -1,13 +1,16 @@
 import bpy
 
+from collections import deque
 from mathutils import Vector as V
 from bpy.types import Context, Event
 from bpy.props import BoolProperty, IntProperty, StringProperty
 from .pf_functions import point_on_node
-from .draw_handlers import draw_callback_px, timer
+from .draw_handlers import draw_callback_px, timer, is_op_enabled
 from .pf_settings import PolyFramesSettings, FrameItem
 from ..shared.helpers import Polygon, Rectangle, Op, view_to_region, region_to_view, get_active_tree, dpifac
 from ..shared.functions import get_active_area, compare_event_to_kmis
+
+dont_register = True
 
 handlers = []
 Op.set_logging(True)
@@ -29,11 +32,11 @@ class PolyFramesOperator():
             return True
         return False
 
-    def return_cycle(self, type="RUNNING_MODAL", undo_push=False, redraw=False):
+    def return_cycle(self, type="RUNNING_MODAL", undo_push=False):
         timer.stop("operator")
         if undo_push:
             bpy.ops.ed.undo_push()
-        if redraw and self.area:
+        if self.area:
             self.area.tag_redraw()
         return {type}
 
@@ -51,8 +54,6 @@ class PolyFramesOperator():
         self.event = event
         self.mouse_pos_window = V((event.mouse_x, event.mouse_y))
         self.area = area = get_active_area(context, self.mouse_pos_window, area_type="NODE_EDITOR")
-        if not area:
-            return
         self.region = region = area.regions[3]
         self.node_tree = get_active_tree(context, area)
         self.pf: PolyFramesSettings = self.node_tree.poly_frames
@@ -62,65 +63,78 @@ class PolyFramesOperator():
         self.mouse_pos_view = region_to_view(area, self.mouse_pos_region)
 
 
-class Vars():
-
-    def single_prop(self, name, default=False):
-        """This is a massively overengineered way to add class variables that reset to a default when they are read"""
-        setattr(self, "_" + name, default)
-
-        def get(self, name, default):
-            val = getattr(self, "_" + name)
-            setattr(self, "_" + name, default)
-            return val
-
-        setattr(
-            self.__class__,
-            name,
-            property(
-                lambda self: get(self, name, default),
-                lambda self, val: setattr(self, "_" + name, val),
-            ),
-        )
-
-
 @Op(category="node")
 class POLY_FRAMES_OT_poly_frames_enable(PolyFramesOperator):
     """Show poly frames in the node editor"""
 
+    click = False
+
     def cancel(self, context):
         global is_op_enabled
         is_op_enabled = False
-        print("cancel")
 
     def invoke(self, context, event):
-        if context.area.type != 'NODE_EDITOR' or not context.space_data.node_tree:
-            return {'CANCELLED'}
-
-        self.init_vars()
+        # if context.area.type != 'NODE_EDITOR' or not context.space_data.node_tree:
+        #     self.report({'WARNING'}, "Node editor not found, cannot run operator")
+        #     return {'CANCELLED'}
 
         self.dragging_frames: list[FrameItem] = []
+        self.mouse_pos_view = V((0, 0))
+        self.mouse_pos_region = V((0, 0))
+        self.mouse_pos_window = V((0, 0))
         self.prev_pos = V((0, 0))
         self.start_pos = V((0, 0))
         self.on_frame = None
+        self.prev_events = deque(maxlen=5)
         self.moving = False
         self.move_is_tweak = False
+        self.area: bpy.types.Area = None
+        print("slkdjfsdlkfjlsd")
 
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
-    def modal(self, context, event):
-        timer.start("operator")
-        try:
-            self.set_vars(context, event)
-        except AttributeError:
-            return self.return_cycle("PASS_THROUGH")
-        if variables.click:
-            print("click!")
+        key_config = context.window_manager.keyconfigs[0]
+        node_keymap_items = key_config.keymaps["Node Editor"].keymap_items
+        kmis = {kmi for kmi in node_keymap_items if kmi.idname == "transform.translate"}
+        duplicates = set()
+        for kmi in kmis:
+            if kmi in duplicates:
+                continue
+            for kmi2 in kmis:
+                if kmi == kmi2:
+                    continue
+                if kmi.compare(kmi2):
+                    duplicates.add(kmi2)
+        self.move_kmis = kmis - duplicates
+        if self.move_kmis:
+            modal_km = key_config.keymaps.find_modal(tuple(self.move_kmis)[0].idname)
+            self.move_confirm_kmis = {kmi for kmi in modal_km.keymap_items if kmi.propvalue == "CONFIRM"}
+            self.move_cancel_kmis = {kmi for kmi in modal_km.keymap_items if kmi.propvalue == "CANCEL"}
         else:
-            print("lslsl")
-        if variables.shift_click:
-            print("shift_click!")
-        return self.return_cycle("PASS_THROUGH")
+            self.move_confirm_kmis = set()
+            self.move_cancel_kmis = set()
+
+        # draw behind nodes by using 'BACKDROP'
+        global handlers
+        self._handle = bpy.types.SpaceNodeEditor.draw_handler_add(
+            draw_callback_px,
+            (self, context),
+            "WINDOW",
+            "BACKDROP",
+        )
+
+        for area in context.screen.areas:
+            if area.type == "NODE_EDITOR":
+                area.tag_redraw()
+
+        handlers.append(self._handle)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        self.__class__.click = False
+        return {"PASS_THROUGH"}
 
     def modal2(self, context, event):
         timer.start("operator")
@@ -359,9 +373,6 @@ class POLY_FRAMES_OT_poly_frames_enable(PolyFramesOperator):
         return self.return_cycle("PASS_THROUGH")
 
 
-# def on_click(self,):
-
-
 @Op(category="node", label="Select poly frame")
 class PF_OT_select_poly_frame(PolyFramesOperator):
     """Select this poly frame"""
@@ -505,6 +516,33 @@ class PF_OT_move_poly_frames(PolyFramesOperator):
         if cancel:
             return {"CANCELLED"}
         return {"RUNNING_MODAL"}
+
+
+# @Op(category="node", label="Move nodes")
+# class PF_OT_move_poly_nodes(PolyFramesOperator):
+#     """Move the currently selected nodes without pushing an undo state."""
+
+#     def invoke(self, context: Context, event: Event):
+#         try:
+#             node_tree = context.space_data.node_tree
+#         except AttributeError:
+#             return {"FINISHED"}
+
+#         self.nodes = {n for n in node_tree.nodes if n.select}
+#         context.window_manager.modal_handler_add(self)
+#         return {"RUNNING_MODAL"}
+
+#     def modal(self, context: Context, event: Event):
+
+#         if event.value == "RELEASE":
+#             return {"FINISHED"}
+#         mouse_pos = V((event.mouse_x, event.mouse_y))
+#         prev_pos = V((event.mouse_prev_x, event.mouse_prev_y))
+
+#         difference = mouse_pos - prev_pos
+#         bpy.ops.transform.translate(value=difference.to_3d() * 2)
+#         # for node in self.nodes:
+#         return {"RUNNING_MODAL"}
 
 
 @Op(category="node", label="Add to poly frame")
@@ -661,20 +699,21 @@ class PF_OT_select_nodes_in_poly_frame(PolyFramesOperator):
     """Select all the nodes contained within a poly frame"""
 
 
-@Op(category="node", invoke=False)
+@Op(category="node")
 class PF_OT_set_poly_frames_attr(PolyFramesOperator):
 
     name: StringProperty()
 
+    def invoke(self, context, event):
+        op = POLY_FRAMES_OT_poly_frames_enable
+        setattr(op, self.name, True)
+        return self.execute(context)
+
     def execute(self, context):
-        print("ho")
-        global variables
-        setattr(variables, self.name, True)
-        return {'PASS_THROUGH'}
+        return {'FINISHED'}
 
 
 addon_keymaps = []
-variables = Vars()
 
 
 def register():
@@ -683,26 +722,14 @@ def register():
     # bpy.ops.node.poly_frames_enable("INVOKE_DEFAULT")
     if kc:
         km = kc.keymaps.new(name='Node Editor', space_type='NODE_EDITOR')
-        variables.single_prop("click", default=False)
 
         kmi = km.keymap_items.new(
             PF_OT_set_poly_frames_attr.bl_idname,
-            type='LEFTMOUSE',
+            type='K',
             value='PRESS',
         )
         kmi.properties.name = "click"
         addon_keymaps.append((km, kmi))
-
-        variables.single_prop("shift_click", default=False)
-        kmi = km.keymap_items.new(
-            PF_OT_set_poly_frames_attr.bl_idname,
-            type='LEFTMOUSE',
-            shift=True,
-            value='PRESS',
-        )
-        kmi.properties.name = "shift_click"
-        addon_keymaps.append((km, kmi))
-        return
 
         kmi = km.keymap_items.new(
             PF_OT_select_poly_frame.bl_idname,
