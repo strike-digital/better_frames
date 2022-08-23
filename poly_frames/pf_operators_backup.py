@@ -623,7 +623,7 @@ class PF_OT_add_to_poly_frame(PolyFramesOperator):
         return {"FINISHED"}
 
 
-@Op(category="node", undo_push=True)
+@Op(category="node", undo=True)
 class PF_OT_new_poly_frame(PolyFramesOperator):
     """Add a new poly frame from the current selection"""
 

@@ -114,12 +114,12 @@ class POLY_FRAMES_OT_poly_frames_enable(PolyFramesOperator):
             self.set_vars(context, event)
         except AttributeError:
             return self.return_cycle("PASS_THROUGH")
-        if variables.click:
-            print("click!")
-        else:
-            print("lslsl")
-        if variables.shift_click:
-            print("shift_click!")
+        # if variables.click:
+        #     print("click!")
+        # else:
+        #     print("lslsl")
+        # if variables.shift_click:
+        #     print("shift_click!")
         return self.return_cycle("PASS_THROUGH")
 
     def modal2(self, context, event):
@@ -585,7 +585,7 @@ class PF_OT_add_to_poly_frame(PolyFramesOperator):
         return {"FINISHED"}
 
 
-@Op(category="node", undo_push=True)
+@Op(category="node", undo=True)
 class PF_OT_new_poly_frame(PolyFramesOperator):
     """Add a new poly frame from the current selection"""
 
